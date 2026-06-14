@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Tool output
+*_enhanced.pdf
+enhanced/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Do NOT commit real documents (may contain sensitive data)
+*.pdf
+!sample_faint.pdf
