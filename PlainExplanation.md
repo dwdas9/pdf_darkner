@@ -13,36 +13,37 @@ The HTML is a three pane workspace:
 - Middle: the original page (Before), with zoom and pan to inspect it.
 - Right: the processed page (After), so the original and the result sit side by side.
 
-The two view panes stay synced by default, so scrolling or zooming one moves the other. There is also a difference view that highlights what changed between Before and After. One key point on the design: nothing is changed automatically. The user decides what to apply, whether it is one page, selected pages, all pages, or just a drawn region when only part of a page is faint.
+The two view panes stay synced by default, so scrolling or zooming one moves the other. There is also a difference view that highlights what changed between Before and After.
 
 The pseudo code
 
-In one line: read each page's pixels, find where the ink sits versus the paper, and if the ink is too light, stretch and darken it. Good pages are left untouched.
+There are two stages. The app analyses the pages on its own, but it does not change anything until the user decides to apply it.
 
-  FUNCTION darken_pdf(input_pdf):
-      FOR each page IN input_pdf:
-          image   = render page to grayscale
-          metrics = ANALYZE(image)
-          IF metrics.verdict == "faint":
-              write ENHANCE(image, metrics) to output
-          ELSE:
-              write original page to output      // healthy pages untouched
-      RETURN output_pdf
+Stage 1, when a PDF is opened (automatic, review only):
 
-  FUNCTION ANALYZE(image):
-      background   = brightness of the paper
-      ink_amount   = how much of the page is ink
-      ink_darkness = typical brightness of the ink
-      contrast     = background - ink_darkness
-      IF ink_amount is almost zero:                      verdict = "blank"
-      ELSE IF ink is too light OR contrast is too low:   verdict = "faint"
-      ELSE:                                              verdict = "ok"
-      RETURN { background, ink_darkness, contrast, verdict }
+  FOR each page in the PDF:
+      render the page and read the brightness of its pixels
+      find the paper colour (background) and the ink (pixels darker than the paper)
+      measure how dark the ink is and the contrast against the paper
 
-  FUNCTION ENHANCE(image, metrics):
-      // 1. Stretch the faint ink down toward black, keep the paper white
-      // 2. Apply gamma to pull mid-tones further toward black
-      // 3. (optional) for the worst scans, convert to pure black & white
-      RETURN enhanced image
+      IF there is almost no ink:                          flag the page as blank
+      ELSE IF the ink is too light or contrast is too low: flag the page as faint
+      ELSE:                                                flag the page as ok
 
-Two things to note: it works per page and only touches the faint ones, so normal documents are never degraded. And it is not inventing content, just re-stretching the faint ink so it survives the capture step. That is the same thing the print, darken and rescan workaround does, only digitally.
+  // nothing is darkened here, the flags just show the user where the faint pages are
+
+Stage 2, when the user applies (their choice of pages):
+
+  the user sets the darkening, then picks where to apply it
+  (this page, selected pages, all pages, or just a drawn region of a page)
+
+  FOR each chosen page (or region):
+      stretch the ink down toward black while keeping the paper white
+      darken the mid-tones a bit more
+      save the improved page
+
+  // pages the user does not pick are left exactly as they were
+
+A couple of things worth noting. The user is always in control, the tool only flags and never changes a page on its own. And it is not inventing anything, just re-stretching the faint ink so it survives the capture step. That is the same thing the print, darken and rescan workaround does, only digitally.
+
+Happy to walk through it or demo it whenever works for you.
