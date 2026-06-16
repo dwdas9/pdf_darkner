@@ -1,3 +1,4 @@
+```pseudocode
 FUNCTION darken_pdf(input_pdf):
     FOR each page IN input_pdf:
         image    = render page to grayscale
@@ -44,3 +45,4 @@ FUNCTION ENHANCE(image, metrics):
             pixel = (pixel < threshold) ? black : white
 
     RETURN enhanced image
+```
