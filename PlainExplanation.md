@@ -45,5 +45,3 @@ Stage 2, when the user applies (their choice of pages):
   // pages the user does not pick are left exactly as they were
 
 A couple of things worth noting. The user is always in control, the tool only flags and never changes a page on its own. And it is not inventing anything, just re-stretching the faint ink so it survives the capture step. That is the same thing the print, darken and rescan workaround does, only digitally.
-
-Happy to walk through it or demo it whenever works for you.
