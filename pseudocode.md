@@ -46,3 +46,30 @@ FUNCTION ENHANCE(image, metrics):
 
     RETURN enhanced image
 ```
+
+$path="$env:USERPROFILE\Desktop\silence.wav"
+
+$sampleRate = 44100
+$seconds = 3600
+$numSamples = $sampleRate * $seconds
+
+$bw = New-Object System.IO.BinaryWriter([System.IO.File]::Create($path))
+
+$bw.Write([Text.Encoding]::ASCII.GetBytes("RIFF"))
+$bw.Write(36 + $numSamples * 2)
+$bw.Write([Text.Encoding]::ASCII.GetBytes("WAVEfmt "))
+$bw.Write(16)
+$bw.Write([int16]1)
+$bw.Write([int16]1)
+$bw.Write($sampleRate)
+$bw.Write($sampleRate * 2)
+$bw.Write([int16]2)
+$bw.Write([int16]16)
+$bw.Write([Text.Encoding]::ASCII.GetBytes("data"))
+$bw.Write($numSamples * 2)
+
+for ($i=0; $i -lt $numSamples; $i++) {
+    $bw.Write([int16]0)
+}
+
+$bw.Close()
