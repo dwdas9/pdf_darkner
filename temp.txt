@@ -1,66 +1,21 @@
-Root cause analysis
-False multifeed errors on Kodak i4600 after scanner repair
-Summary
-The Kodak i4600 used for the COM-LOAN scanning process started reporting multifeed errors after a recent repair. The scanner stops the batch and shows E L on the operator panel, sometimes as early as the first page, when only a single sheet has gone through.
-We reproduced the same error outside ScanPlus, using Kodak’s own Scan Validation Tool. So the problem sits with the scanner and not with Captiva. Calibration through ScanPlus did not clear it. The technician has accepted this and will come back.
-Environment
-Application	OpenText Captiva ScanPlus, version 22+
-Scanner	Kodak i4600
-Process	COM-LOAN
-Scan mode	Duplex
-ScanPlus driver interface	ISIS
-Scan Validation Tool interface	TWAIN
-Multifeed detection	Ultrasonic, enabled, sensitivity Medium, action Pause Scanning
+Subject: RE: Scanner / Scan Plus Issue
 
-Symptom
-The scanner stops and reports a multifeed against pages that are single sheets. The operator panel shows E for error and L for multifeed or document too long. The exact panel code still needs to be confirmed against Kodak’s documentation.
-In ScanPlus the batch stops with the "Scanning has stopped" dialog and the operator is asked to continue or finish. Continuing scans one more page and stops again. Through the Scan Validation Tool the underlying TWAIN status is visible:
-TWRC_FAILURE (0x1)
-DAT_STATUS:     TWCC_PAPERDOUBLEFEED (0x15)
-DAT_STATUSRAW:  A multifeed occurred
-Why multifeed detection is enabled
-Multifeed detection uses ultrasonic sensors across the paper path to catch two sheets going through the transport together and being captured as one page. This happens with stapled pages or sheets that stick to each other. For loan files a missed sheet is a missed document, so the feature is part of the process control.
-The user’s requirement is:
-"If there was a multifeed we want to scan but pause it, so that we can put back through the page that was missed."
-That is why the action is set to Pause Scanning rather than Stop Scanning. Turning multifeed detection off is not an acceptable workaround for this process.
-Configuration in use
-The multifeed settings that ScanPlus applies are reached through this path:
-1.	In ScanPlus, open the Scan settings panel.
-2.	Expand ISIS settings and select Configure driver.
-3.	In the "KODAK i4600 on STI - 0000" dialog, select the preset in use under Preset Name.
-4.	Under Properties, select Scanner.
-5.	In the "Properties for KODAK i4600 on STI - 0000" dialog, open the Multifeed Detection tab.
+Hi Carolyn,
 
-The settings on that tab when the failure occurred were:
-•	Length Detection: off
-•	Ultrasonic Detection: enabled
-•	Sensitivity: Medium
-•	Active Sensors: all three enabled
-•	Action: Pause Scanning
+Here is a short summary of where we landed, so you have it before the technician comes on Thursday.
 
-These are the same settings that were in place before the repair, when multifeed worked correctly and did not raise false errors. Nothing was changed in ScanPlus between the working state and the failing state.
- 
-ScanPlus: Multifeed Detection tab, ultrasonic detection enabled at Medium sensitivity.
-What we tested
-The vendor’s test after the repair
-The technician demonstrated that scanning worked using Kodak’s Scan Validation Tool. The user checked the settings used for that demonstration afterwards and found sensitivity was set to None, which means ultrasonic detection was switched off. The test showed that paper transport and image capture were fine, but it did not exercise multifeed detection at all. That is likely why the scanner appeared healthy to the technician while still failing in production.
- 
-Scan Validation Tool: multifeed sensitivity set to None during the vendor’s test.
-Re-test with multifeed enabled
-The user ran the Scan Validation Tool again with ultrasonic detection turned on, and TWCC_PAPERDOUBLEFEED (0x15) came back immediately.
-The Scan Validation Tool talks to the scanner over TWAIN, while ScanPlus talks to it over ISIS. Getting the same error through both paths means the problem sits below both of them. ScanPlus, the ISIS driver and the ScanPlus preset are all out of the picture when the Scan Validation Tool runs, so none of them can be causing it.
-Calibration
-Calibration resets the ultrasonic baseline against a known single sheet. The user ran it from the Multifeed Detection tab in ScanPlus and the false errors continued. If the sensors had only drifted, calibration would normally have corrected that, so a physical problem is now the more likely explanation. On its own this does not prove it.
- 
-Calibration run from the Multifeed Detection tab. The errors continued afterwards.
-Vendor position
-The user raised the reproduction with the technician, who accepted the scanner is at fault and confirmed he will return. His account was that he did not touch the sensor during the repair, but something has happened to it.
-Conclusion
-The ultrasonic multifeed detection on the scanner has not worked correctly since the repair. It reports a multifeed against single sheets, and the fault follows the device rather than the application or the driver.
-We have not confirmed the physical cause, and it will need the vendor to establish it. Possibilities include a sensor knocked out of alignment, a connector left loose during reassembly, or debris in the sensor path.
-The fault was missed at the time of the repair because the verification test was run with multifeed detection disabled.
-Next steps
-1.	Vendor to service the ultrasonic multifeed sensor path specifically. Reference the TWCC_PAPERDOUBLEFEED (0x15) reproduction so the sensor path is inspected and not just the transport.
-2.	Verification after the repair must be run with ultrasonic detection enabled at Medium sensitivity, on actual COM-LOAN paper stock, with a full duplex batch and no false multifeed errors.
-3.	Do not disable multifeed detection as a workaround, since that removes the control that prevents pages being lost from loan files.
-4.	If scanning has to continue before the vendor returns, reconcile page counts manually against each batch and record it.
+The scanner reports a multifeed against pages that are single sheets and stops the batch. When you reproduced it through Kodak's own Scan Validation Tool, the same error came back as TWCC_PAPERDOUBLEFEED (0x15). That tool does not involve ScanPlus or the ISIS driver at all, so the problem sits with the scanner and not with the application. That test is what gives us a clear answer here, so thank you for running it.
+
+One thing worth knowing: when the technician tested after the repair, multifeed sensitivity was set to None, which means ultrasonic detection was switched off for that test. It showed the paper feed and image capture were working, but it did not test the part that is actually failing.
+
+The calibration you ran from ScanPlus did not clear the errors either, so a physical problem with the ultrasonic sensors is the more likely explanation. It could be a sensor knocked out of alignment, a loose connector, or debris in the sensor path. The technician will need to confirm which.
+
+Two things would help on Thursday:
+
+1. Ask him to check the ultrasonic multifeed sensor path specifically, not just the paper transport.
+2. Any test after the repair should be run with ultrasonic detection on at Medium sensitivity, using your normal paper stock and a full batch.
+
+We would like to be on the call when he visits.
+
+Thanks,
+Das
