@@ -1,12 +1,12 @@
 @echo off
 setlocal
-where powershell.exe >nul 2>&1 || (
+set "POWERSEARCH_SELF=%~f0"
+powershell.exe -NoProfile -STA -Command "$s=[IO.File]::ReadAllText($env:POWERSEARCH_SELF); $m=[char]35+'PS-BEGIN'; $i=$s.LastIndexOf($m); if($i -lt 0){throw 'Embedded PowerShell section not found'}; iex $s.Substring($i+$m.Length)"
+if "%errorlevel%"=="9009" (
   echo PowerShell is not available on this Windows machine.
   pause
   exit /b 1
 )
-set "POWERSEARCH_SELF=%~f0"
-powershell.exe -NoProfile -STA -Command "$s=[IO.File]::ReadAllText($env:POWERSEARCH_SELF); $m=[char]35+'PS-BEGIN'; $i=$s.LastIndexOf($m); if($i -lt 0){throw 'Embedded PowerShell section not found'}; iex $s.Substring($i+$m.Length)"
 exit /b
 
 #PS-BEGIN
