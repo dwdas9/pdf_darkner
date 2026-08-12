@@ -1,1 +1,1382 @@
-Temp
+@echo off
+setlocal
+where powershell.exe >nul 2>&1 || (
+  echo PowerShell is not available on this Windows machine.
+  pause
+  exit /b 1
+)
+set "POWERSEARCH_SELF=%~f0"
+powershell.exe -NoProfile -STA -Command "$s=[IO.File]::ReadAllText($env:POWERSEARCH_SELF); $m=[char]35+'PS-BEGIN'; $i=$s.LastIndexOf($m); if($i -lt 0){throw 'Embedded PowerShell section not found'}; iex $s.Substring($i+$m.Length)"
+exit /b
+
+#PS-BEGIN
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+try { [void][System.Windows.Forms.Application]::SetHighDpiMode([System.Windows.Forms.HighDpiMode]::PerMonitorV2) } catch { }
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+
+$script:CancelRequested = $false
+$script:TextExtensions = @(
+    ".txt",".log",".csv",".tsv",".json",".xml",".yaml",".yml",
+    ".ini",".cfg",".conf",".md",".rtf",".url",".reg",".ps1",".psm1",".psd1",".bat",".cmd",
+    ".py",".js",".ts",".tsx",".jsx",".css",".html",".htm",".sql",
+    ".java",".c",".h",".cpp",".hpp",".cs",".go",".rs",".rb",".php",
+    ".sh",".zsh",".properties",".toml",".env"
+)
+$script:OfficeExtensions = @(".docx", ".xlsx", ".pptx")
+$script:AllRows = New-Object Collections.Generic.List[object]
+$script:SortField = $null
+$script:SortAscending = $true
+$script:RegexTimeoutCount = 0
+$script:SettingsDir = Join-Path $env:APPDATA "PowerSearch"
+$script:SettingsPath = Join-Path $script:SettingsDir "settings.json"
+
+function Show-Message {
+    param(
+        [string]$Text,
+        [string]$Title = "PowerSearch",
+        [System.Windows.Forms.MessageBoxIcon]$Icon = [System.Windows.Forms.MessageBoxIcon]::Information
+    )
+    [System.Windows.Forms.MessageBox]::Show(
+        $Text, $Title,
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        $Icon
+    ) | Out-Null
+}
+
+function Get-Settings {
+    $default = [pscustomobject]@{
+        Folder            = [Environment]::GetFolderPath("MyDocuments")
+        NameHistory       = @()
+        ContentHistory    = @()
+        ExtensionText     = "All files"
+        IncludeSubfolders = $true
+        AdvancedVisible   = $false
+        ExcludeFolders    = ".git,node_modules,.venv,venv"
+        UseRegex          = $false
+        CaseSensitive     = $false
+        UseNameWildcards  = $false
+        SimilarSpelling   = $true
+        MatchMode         = "Exact phrase"
+        ShowContext       = $false
+        ContextLines      = 2
+        TryOtherTextTypes = $true
+        DateFilterField   = "Modified"
+    }
+    if (Test-Path -LiteralPath $script:SettingsPath) {
+        try {
+            $loaded = Get-Content -LiteralPath $script:SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($p in $default.PSObject.Properties.Name) {
+                if ($loaded.PSObject.Properties.Name -contains $p -and $null -ne $loaded.$p) { $default.$p = $loaded.$p }
+            }
+        } catch { }
+    }
+    return $default
+}
+
+function Save-Settings {
+    param($Settings)
+    try {
+        if (-not (Test-Path -LiteralPath $script:SettingsDir)) { New-Item -ItemType Directory -Path $script:SettingsDir -Force | Out-Null }
+        $Settings | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+    } catch { }
+}
+
+function Add-HistoryEntry {
+    param([string[]]$History, [string]$Entry, [int]$Max = 15)
+    if ([string]::IsNullOrWhiteSpace($Entry)) { return @($History) }
+    $list = New-Object Collections.Generic.List[string]
+    [void]$list.Add($Entry)
+    foreach ($h in @($History)) { if ($h -and $h -ne $Entry -and -not $list.Contains($h)) { [void]$list.Add($h) } }
+    if ($list.Count -gt $Max) { $list = $list.GetRange(0, $Max) }
+    return @($list)
+}
+
+$script:Settings = Get-Settings
+
+function Get-OpenXmlText {
+    param([string]$Path)
+    $zip = $null
+    try {
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        $wanted = switch ([IO.Path]::GetExtension($Path).ToLowerInvariant()) {
+            ".docx" { @("word/document.xml", "word/header", "word/footer") }
+            ".xlsx" { @("xl/sharedStrings.xml", "xl/worksheets/") }
+            ".pptx" { @("ppt/slides/") }
+            default { @() }
+        }
+        $builder = New-Object Text.StringBuilder
+        foreach ($entry in $zip.Entries) {
+            $include = $false
+            foreach ($prefix in $wanted) {
+                if ($entry.FullName -eq $prefix -or $entry.FullName.StartsWith($prefix)) { $include = $true; break }
+            }
+            if (-not $include -or -not $entry.FullName.EndsWith(".xml")) { continue }
+            $reader = New-Object IO.StreamReader($entry.Open())
+            try { $xmlText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            $plain = $xmlText -replace '</(w:p|a:p|si|row)>', "`n" -replace '<[^>]+>', ' '
+            [void]$builder.AppendLine([Net.WebUtility]::HtmlDecode($plain))
+        }
+        return $builder.ToString()
+    }
+    catch {
+        return ""
+    }
+    finally {
+        if ($zip) { $zip.Dispose() }
+    }
+}
+
+function Test-LikelyTextFile {
+    param([IO.FileInfo]$File)
+    if ($script:TextExtensions -contains $File.Extension.ToLowerInvariant() -or
+        $script:OfficeExtensions -contains $File.Extension.ToLowerInvariant()) { return $true }
+    # Extensionless files (logs, Dockerfile, README, LICENSE, ...) fall through to the
+    # same byte-sniffing below rather than being assumed text -- a genuinely binary
+    # file with no extension should not be scanned as if it were readable.
+    $stream = $null
+    try {
+        $stream = New-Object IO.FileStream($File.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $buffer = New-Object byte[] 4096
+        $count = $stream.Read($buffer, 0, $buffer.Length)
+        if ($count -eq 0) { return $true }
+        $zeroEven = 0; $zeroOdd = 0
+        for ($i = 0; $i -lt $count; $i++) {
+            if ($buffer[$i] -eq 0) { if (($i % 2) -eq 0) { $zeroEven++ } else { $zeroOdd++ } }
+        }
+        # NULs usually mean binary; regular NULs on one byte position indicate UTF-16.
+        if (($zeroEven + $zeroOdd) -eq 0) { return $true }
+        return (($zeroEven -gt ($count / 8)) -xor ($zeroOdd -gt ($count / 8)))
+    }
+    catch { return $false }
+    finally { if ($stream) { $stream.Dispose() } }
+}
+
+function Find-FileContentMatches {
+    param(
+        [IO.FileInfo]$File,
+        [string]$Pattern,
+        [bool]$UseRegex,
+        [bool]$CaseSensitive,
+        [string]$MatchMode = "Exact phrase",
+        [bool]$SimilarSpelling = $true,
+        [int]$ContextLines = 0,
+        [int]$MaximumMatches = 20
+    )
+
+    $comparison = if ($CaseSensitive) { [StringComparison]::Ordinal } else { [StringComparison]::OrdinalIgnoreCase }
+    $terms = @($Pattern -split '\s+' | Where-Object { $_ })
+    $alternatives = @()
+    if ($SimilarSpelling -and -not $UseRegex -and $Pattern.Length -ge 5 -and $Pattern -notmatch '\s') {
+        for ($i = 0; $i -lt $Pattern.Length; $i++) { $alternatives += $Pattern.Remove($i, 1) }
+    }
+    $regex = $null
+    if ($UseRegex) {
+        $options = if ($CaseSensitive) { [Text.RegularExpressions.RegexOptions]::None } else { [Text.RegularExpressions.RegexOptions]::IgnoreCase }
+        # A timeout stops a catastrophic-backtracking pattern (e.g. "(a+)+$") from
+        # hanging the search forever on one line; Cancel only gets checked between
+        # lines/files, not inside an in-flight IsMatch(), so without this a bad
+        # pattern is otherwise unrecoverable short of force-closing the app.
+        $regex = New-Object Text.RegularExpressions.Regex($Pattern, $options, [TimeSpan]::FromSeconds(2))
+    }
+
+    # Returns whether a line matches, and whether the match only came from a
+    # close-spelling alternative (so the caller can flag it as non-exact).
+    $lineMatches = {
+        param([string]$Line)
+        if ($UseRegex) {
+            try { return [pscustomobject]@{ Match = $regex.IsMatch($Line); Fuzzy = $false } }
+            catch [Text.RegularExpressions.RegexMatchTimeoutException] {
+                $script:RegexTimeoutCount++
+                return [pscustomobject]@{ Match = $false; Fuzzy = $false }
+            }
+        }
+        if ($MatchMode -eq "All words") {
+            foreach ($term in $terms) { if ($Line.IndexOf($term, $comparison) -lt 0) { return [pscustomobject]@{ Match = $false; Fuzzy = $false } } }
+            return [pscustomobject]@{ Match = ($terms.Count -gt 0); Fuzzy = $false }
+        }
+        if ($MatchMode -eq "Any word") {
+            foreach ($term in $terms) { if ($Line.IndexOf($term, $comparison) -ge 0) { return [pscustomobject]@{ Match = $true; Fuzzy = $false } } }
+            return [pscustomobject]@{ Match = $false; Fuzzy = $false }
+        }
+        if ($Line.IndexOf($Pattern, $comparison) -ge 0) { return [pscustomobject]@{ Match = $true; Fuzzy = $false } }
+        foreach ($alternative in $alternatives) { if ($Line.IndexOf($alternative, $comparison) -ge 0) { return [pscustomobject]@{ Match = $true; Fuzzy = $true } } }
+        return [pscustomobject]@{ Match = $false; Fuzzy = $false }
+    }
+
+    $reader = $null; $stream = $null
+    $resultsFound = New-Object Collections.ArrayList
+    $before = New-Object 'Collections.Generic.Queue[string]'
+    $pending = New-Object Collections.ArrayList
+    try {
+        if ($script:OfficeExtensions -contains $File.Extension.ToLowerInvariant()) {
+            $reader = New-Object IO.StringReader((Get-OpenXmlText -Path $File.FullName))
+        } else {
+            # Read files even while another application is appending or rotating them.
+            $stream = New-Object IO.FileStream($File.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete), 65536, [IO.FileOptions]::SequentialScan)
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 65536, $true)
+        }
+        $lineNumber = 0
+        while (($line = $reader.ReadLine()) -ne $null -and -not $script:CancelRequested) {
+            $lineNumber++
+            foreach ($waiting in @($pending)) {
+                [void]$waiting.Context.Add($line)
+                $waiting.Remaining--
+                if ($waiting.Remaining -le 0) {
+                    $waiting.Preview = $(if ($waiting.Fuzzy) { "~ " } else { "" }) + ($waiting.Context -join "  |  ")
+                    [void]$resultsFound.Add($waiting)
+                    [void]$pending.Remove($waiting)
+                }
+            }
+            if (($resultsFound.Count + $pending.Count) -lt $MaximumMatches) {
+                $hit = & $lineMatches $line
+                if ($hit.Match) {
+                    $context = New-Object Collections.ArrayList
+                    foreach ($prior in $before) { [void]$context.Add($prior) }
+                    [void]$context.Add($line)
+                    $match = [pscustomobject]@{ LineNumber=$lineNumber; MatchLine=$line; Context=$context; Remaining=$ContextLines; Preview=""; Fuzzy=$hit.Fuzzy }
+                    if ($ContextLines -eq 0) {
+                        $match.Preview = $(if ($hit.Fuzzy) { "~ " } else { "" }) + $line
+                        [void]$resultsFound.Add($match)
+                    }
+                    else { [void]$pending.Add($match) }
+                }
+            }
+            $before.Enqueue($line)
+            while ($before.Count -gt $ContextLines) { [void]$before.Dequeue() }
+            if (($lineNumber % 250) -eq 0) { [Windows.Forms.Application]::DoEvents() }
+            if ($resultsFound.Count -ge $MaximumMatches -and $pending.Count -eq 0) { break }
+        }
+        foreach ($waiting in @($pending)) {
+            $waiting.Preview = $(if ($waiting.Fuzzy) { "~ " } else { "" }) + ($waiting.Context -join "  |  ")
+            [void]$resultsFound.Add($waiting)
+        }
+        return @($resultsFound)
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Format-Size {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return "{0:N1} KB" -f ($Bytes / 1KB) }
+    return "$Bytes B"
+}
+
+function New-ResultRow {
+    param(
+        [System.IO.FileSystemInfo]$File,
+        [Nullable[int]]$LineNumber = $null,
+        [string]$Preview = "",
+        [string]$MatchLine = ""
+    )
+    $cleanPreview = ($Preview -replace '\s+', ' ').Trim()
+    $displayPreview = $cleanPreview
+    if ($displayPreview.Length -gt 300) { $displayPreview = $displayPreview.Substring(0, 297) + "..." }
+    $isFolder = $File -is [System.IO.DirectoryInfo]
+    # DirectoryInfo has no DirectoryName property (only FileInfo does), so a
+    # folder result would otherwise get Folder = $null and later crash
+    # Test-RowMatchesFilter's $Row.Folder.IndexOf(...) as soon as the user
+    # types into "Filter results" (or exports with a filter active).
+    $parentFolder = if ($isFolder) { $(if ($File.Parent) { $File.Parent.FullName } else { "" }) } else { $File.DirectoryName }
+    return [pscustomobject]@{
+        Name            = $File.Name
+        Folder          = $parentFolder
+        LineNumber      = $LineNumber
+        LineDisplay     = $(if ($null -eq $LineNumber) { "" } else { $LineNumber.ToString("N0") })
+        PreviewFull     = $cleanPreview
+        PreviewDisplay  = $displayPreview
+        MatchLine       = $MatchLine
+        SizeBytes       = $(if ($isFolder) { -1 } else { $File.Length })
+        SizeDisplay     = $(if ($isFolder) { "" } else { Format-Size $File.Length })
+        TypeDisplay     = $(if ($isFolder) { "Folder" } else { $File.Extension.TrimStart('.').ToUpperInvariant() })
+        Modified        = $File.LastWriteTime
+        ModifiedDisplay = $File.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+        Created         = $File.CreationTime
+        CreatedDisplay  = $File.CreationTime.ToString("yyyy-MM-dd HH:mm")
+        Path            = $File.FullName
+        IsFolder        = $isFolder
+    }
+}
+
+function New-ResultListViewItem {
+    param($Row)
+    $item = New-Object System.Windows.Forms.ListViewItem($Row.Name)
+    [void]$item.SubItems.Add($Row.Folder)
+    [void]$item.SubItems.Add($Row.LineDisplay)
+    [void]$item.SubItems.Add($Row.PreviewDisplay)
+    [void]$item.SubItems.Add($Row.SizeDisplay)
+    [void]$item.SubItems.Add($Row.TypeDisplay)
+    [void]$item.SubItems.Add($Row.ModifiedDisplay)
+    [void]$item.SubItems.Add($Row.CreatedDisplay)
+    $item.Tag = $Row
+    if ($Row.PreviewFull -and $Row.PreviewFull -ne $Row.PreviewDisplay) { $item.ToolTipText = $Row.PreviewFull }
+    return $item
+}
+
+function Test-RowMatchesFilter {
+    param($Row, [string]$FilterText)
+    if ([string]::IsNullOrWhiteSpace($FilterText)) { return $true }
+    return ($Row.Name.IndexOf($FilterText, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+           ($Row.Folder.IndexOf($FilterText, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+           ($Row.PreviewFull.IndexOf($FilterText, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
+function Render-Results {
+    $filterText = $txtFilterResults.Text.Trim()
+    # Windows PowerShell 5.1 has a DLR binder bug where wrapping a
+    # List[object] directly in @(...) throws "Argument types do not match".
+    # .ToArray() sidesteps the buggy conversion path entirely.
+    $rows = $script:AllRows.ToArray()
+    if ($script:SortField) {
+        $rows = @($rows | Sort-Object -Property $script:SortField -Descending:(-not $script:SortAscending))
+    }
+    $results.BeginUpdate()
+    try {
+        $results.Items.Clear()
+        $shown = 0
+        foreach ($row in $rows) {
+            if (Test-RowMatchesFilter -Row $row -FilterText $filterText) {
+                [void]$results.Items.Add((New-ResultListViewItem $row))
+                $shown++
+            }
+        }
+    } finally { $results.EndUpdate() }
+    $lblResultCount.Text = if ($script:AllRows.Count -eq 0) { "" }
+        elseif ($shown -eq $script:AllRows.Count) { "$shown result(s)" }
+        else { "$shown of $($script:AllRows.Count) result(s)" }
+}
+
+function Add-ResultRow {
+    param(
+        [System.IO.FileSystemInfo]$File,
+        [Nullable[int]]$LineNumber = $null,
+        [string]$Preview = "",
+        [string]$MatchLine = ""
+    )
+    $row = New-ResultRow -File $File -LineNumber $LineNumber -Preview $Preview -MatchLine $MatchLine
+    [void]$script:AllRows.Add($row)
+    [void]$results.Items.Add((New-ResultListViewItem $row))
+}
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "PowerSearch"
+$form.StartPosition = "CenterScreen"
+$form.Size = New-Object System.Drawing.Size(1080, 800)
+$form.MinimumSize = New-Object System.Drawing.Size(900, 700)
+$form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+
+# Folder
+$lblFolder = New-Object System.Windows.Forms.Label
+$lblFolder.Text = "Folder"
+$lblFolder.Location = New-Object System.Drawing.Point(18, 20)
+$lblFolder.AutoSize = $true
+$form.Controls.Add($lblFolder)
+
+$txtFolder = New-Object System.Windows.Forms.TextBox
+$txtFolder.Location = New-Object System.Drawing.Point(90, 16)
+$txtFolder.Size = New-Object System.Drawing.Size(820, 25)
+$txtFolder.Anchor = "Top,Left,Right"
+$txtFolder.Text = $script:Settings.Folder
+$txtFolder.AllowDrop = $true
+$txtFolder.AccessibleName = "Folder to search"
+$form.Controls.Add($txtFolder)
+
+$btnBrowse = New-Object System.Windows.Forms.Button
+$btnBrowse.Text = "Browse..."
+$btnBrowse.Location = New-Object System.Drawing.Point(920, 14)
+$btnBrowse.Size = New-Object System.Drawing.Size(120, 28)
+$btnBrowse.Anchor = "Top,Right"
+$form.Controls.Add($btnBrowse)
+
+# Name
+$lblName = New-Object System.Windows.Forms.Label
+$lblName.Text = "File or folder name"
+$lblName.Location = New-Object System.Drawing.Point(18, 58)
+$lblName.AutoSize = $true
+$form.Controls.Add($lblName)
+
+$txtName = New-Object System.Windows.Forms.ComboBox
+$txtName.Location = New-Object System.Drawing.Point(150, 54)
+$txtName.Size = New-Object System.Drawing.Size(300, 25)
+$txtName.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDown
+$txtName.AutoCompleteMode = [Windows.Forms.AutoCompleteMode]::SuggestAppend
+$txtName.AutoCompleteSource = [Windows.Forms.AutoCompleteSource]::ListItems
+[void]$txtName.Items.AddRange(@($script:Settings.NameHistory))
+$txtName.Text = ""
+$txtName.AccessibleName = "File or folder name"
+$form.Controls.Add($txtName)
+
+# Extensions
+$lblExt = New-Object System.Windows.Forms.Label
+$lblExt.Text = "File types"
+$lblExt.Location = New-Object System.Drawing.Point(475, 58)
+$lblExt.AutoSize = $true
+$form.Controls.Add($lblExt)
+
+$txtExt = New-Object System.Windows.Forms.ComboBox
+$txtExt.Location = New-Object System.Drawing.Point(540, 54)
+$txtExt.Size = New-Object System.Drawing.Size(245, 25)
+$txtExt.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDown
+$txtExt.AutoCompleteMode = [Windows.Forms.AutoCompleteMode]::SuggestAppend
+$txtExt.AutoCompleteSource = [Windows.Forms.AutoCompleteSource]::ListItems
+[void]$txtExt.Items.AddRange(@(
+    "All files", "Documents", "Spreadsheets", "Presentations", "Pictures", "Audio and video",
+    "Web pages", "Text and notes", "Archives",
+    "pdf", "doc", "docx", "rtf", "odt", "txt", "md", "log",
+    "xls", "xlsx", "csv", "tsv", "ods", "ppt", "pptx", "odp",
+    "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "heic", "svg", "ico",
+    "mp3", "wav", "m4a", "flac", "aac", "ogg", "mp4", "mov", "avi", "mkv", "wmv", "webm",
+    "html", "htm", "url", "css", "js", "json", "xml", "yaml", "yml",
+    "zip", "7z", "rar", "gz", "tar", "iso",
+    "exe", "msi", "dll", "bat", "cmd", "ps1", "reg",
+    "py", "java", "c", "cpp", "h", "cs", "go", "rs", "sql"
+))
+$txtExt.Text = $script:Settings.ExtensionText
+$txtExt.AccessibleName = "File types"
+$form.Controls.Add($txtExt)
+
+$chkSubfolders = New-Object System.Windows.Forms.CheckBox
+$chkSubfolders.Text = "Include subfolders"
+$chkSubfolders.Location = New-Object System.Drawing.Point(810, 55)
+$chkSubfolders.Size = New-Object System.Drawing.Size(150, 24)
+$chkSubfolders.Checked = [bool]$script:Settings.IncludeSubfolders
+$form.Controls.Add($chkSubfolders)
+
+# Content
+$lblContent = New-Object System.Windows.Forms.Label
+$lblContent.Text = "Words inside the file"
+$lblContent.Location = New-Object System.Drawing.Point(18, 96)
+$lblContent.AutoSize = $true
+$form.Controls.Add($lblContent)
+
+$txtContent = New-Object System.Windows.Forms.ComboBox
+$txtContent.Location = New-Object System.Drawing.Point(150, 92)
+$txtContent.Size = New-Object System.Drawing.Size(635, 25)
+$txtContent.Anchor = "Top,Left,Right"
+$txtContent.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDown
+$txtContent.AutoCompleteMode = [Windows.Forms.AutoCompleteMode]::SuggestAppend
+$txtContent.AutoCompleteSource = [Windows.Forms.AutoCompleteSource]::ListItems
+[void]$txtContent.Items.AddRange(@($script:Settings.ContentHistory))
+$txtContent.Text = ""
+$txtContent.AccessibleName = "Words inside the file"
+$form.Controls.Add($txtContent)
+
+$lblHint = New-Object System.Windows.Forms.Label
+$lblHint.Text = "Leave either search box empty to search everything. Drag a folder onto the Folder box, or choose a file type."
+$lblHint.ForeColor = [Drawing.Color]::DimGray
+$lblHint.Location = New-Object Drawing.Point(150, 122)
+$lblHint.Size = New-Object Drawing.Size(520, 35)
+$form.Controls.Add($lblHint)
+
+$btnSearch = New-Object System.Windows.Forms.Button
+$btnSearch.Text = "Search"
+$btnSearch.Location = New-Object System.Drawing.Point(700, 130)
+$btnSearch.Size = New-Object System.Drawing.Size(115, 34)
+$btnSearch.Anchor = "Top,Right"
+$form.Controls.Add($btnSearch)
+
+$btnCancel = New-Object System.Windows.Forms.Button
+$btnCancel.Text = "Cancel"
+$btnCancel.Location = New-Object System.Drawing.Point(825, 130)
+$btnCancel.Size = New-Object System.Drawing.Size(100, 34)
+$btnCancel.Anchor = "Top,Right"
+$btnCancel.Enabled = $false
+$form.Controls.Add($btnCancel)
+
+$btnHelp = New-Object System.Windows.Forms.Button
+$btnHelp.Text = "Help"
+$btnHelp.Location = New-Object System.Drawing.Point(935, 130)
+$btnHelp.Size = New-Object System.Drawing.Size(105, 34)
+$btnHelp.Anchor = "Top,Right"
+$form.Controls.Add($btnHelp)
+
+$btnAdvanced = New-Object System.Windows.Forms.Button
+$btnAdvanced.Text = "More options"
+$btnAdvanced.Location = New-Object System.Drawing.Point(18, 130)
+$btnAdvanced.Size = New-Object System.Drawing.Size(115, 28)
+$form.Controls.Add($btnAdvanced)
+
+# --- Advanced options: two grouped panels instead of one flat block of controls ---
+
+$grpFilterFiles = New-Object Windows.Forms.GroupBox
+$grpFilterFiles.Text = "Filter which files"
+$grpFilterFiles.Location = New-Object Drawing.Point(18, 172)
+$grpFilterFiles.Size = New-Object Drawing.Size(1022, 118)
+$grpFilterFiles.Anchor = "Top,Left,Right"
+$grpFilterFiles.Visible = $false
+$form.Controls.Add($grpFilterFiles)
+
+$lblExclude = New-Object System.Windows.Forms.Label
+$lblExclude.Text = "Skip folders"
+$lblExclude.Location = New-Object System.Drawing.Point(10, 25)
+$lblExclude.AutoSize = $true
+$grpFilterFiles.Controls.Add($lblExclude)
+
+$txtExclude = New-Object System.Windows.Forms.TextBox
+$txtExclude.Location = New-Object System.Drawing.Point(85, 21)
+$txtExclude.Size = New-Object System.Drawing.Size(300, 25)
+$txtExclude.Text = $script:Settings.ExcludeFolders
+$txtExclude.AccessibleName = "Folders to skip"
+$grpFilterFiles.Controls.Add($txtExclude)
+
+$lblMinSize = New-Object System.Windows.Forms.Label
+$lblMinSize.Text = "Min MB"
+$lblMinSize.Location = New-Object System.Drawing.Point(405, 25)
+$lblMinSize.AutoSize = $true
+$grpFilterFiles.Controls.Add($lblMinSize)
+
+$txtMinSize = New-Object System.Windows.Forms.TextBox
+$txtMinSize.Location = New-Object System.Drawing.Point(460, 21)
+$txtMinSize.Size = New-Object System.Drawing.Size(65, 25)
+$txtMinSize.AccessibleName = "Minimum file size in megabytes"
+$grpFilterFiles.Controls.Add($txtMinSize)
+
+$lblMaxSize = New-Object System.Windows.Forms.Label
+$lblMaxSize.Text = "Max MB"
+$lblMaxSize.Location = New-Object System.Drawing.Point(545, 25)
+$lblMaxSize.AutoSize = $true
+$grpFilterFiles.Controls.Add($lblMaxSize)
+
+$txtMaxSize = New-Object System.Windows.Forms.TextBox
+$txtMaxSize.Location = New-Object System.Drawing.Point(600, 21)
+$txtMaxSize.Size = New-Object System.Drawing.Size(65, 25)
+$txtMaxSize.AccessibleName = "Maximum file size in megabytes"
+$grpFilterFiles.Controls.Add($txtMaxSize)
+
+$chkNamePattern = New-Object System.Windows.Forms.CheckBox
+$chkNamePattern.Text = "Use * and ? in names"
+$chkNamePattern.Location = New-Object System.Drawing.Point(685, 23)
+$chkNamePattern.Size = New-Object System.Drawing.Size(200, 24)
+$chkNamePattern.Checked = [bool]$script:Settings.UseNameWildcards
+$grpFilterFiles.Controls.Add($chkNamePattern)
+
+$chkFrom = New-Object System.Windows.Forms.CheckBox
+$chkFrom.Text = "From date"
+$chkFrom.Location = New-Object System.Drawing.Point(10, 60)
+$chkFrom.Size = New-Object System.Drawing.Size(90, 24)
+$grpFilterFiles.Controls.Add($chkFrom)
+
+$dateFrom = New-Object System.Windows.Forms.DateTimePicker
+$dateFrom.Location = New-Object System.Drawing.Point(105, 58)
+$dateFrom.Size = New-Object System.Drawing.Size(150, 25)
+$dateFrom.Format = "Short"
+$dateFrom.Enabled = $false
+$grpFilterFiles.Controls.Add($dateFrom)
+
+$chkTo = New-Object System.Windows.Forms.CheckBox
+$chkTo.Text = "Until"
+$chkTo.Location = New-Object System.Drawing.Point(270, 60)
+$chkTo.Size = New-Object System.Drawing.Size(55, 24)
+$grpFilterFiles.Controls.Add($chkTo)
+
+$dateTo = New-Object System.Windows.Forms.DateTimePicker
+$dateTo.Location = New-Object System.Drawing.Point(330, 58)
+$dateTo.Size = New-Object System.Drawing.Size(150, 25)
+$dateTo.Format = "Short"
+$dateTo.Enabled = $false
+$grpFilterFiles.Controls.Add($dateTo)
+
+$lblDateField = New-Object System.Windows.Forms.Label
+$lblDateField.Text = "using"
+$lblDateField.Location = New-Object System.Drawing.Point(495, 63)
+$lblDateField.AutoSize = $true
+$grpFilterFiles.Controls.Add($lblDateField)
+
+$cmbDateField = New-Object System.Windows.Forms.ComboBox
+$cmbDateField.Location = New-Object System.Drawing.Point(540, 58)
+$cmbDateField.Size = New-Object System.Drawing.Size(110, 25)
+$cmbDateField.DropDownStyle = "DropDownList"
+[void]$cmbDateField.Items.AddRange(@("Modified", "Created"))
+$cmbDateField.SelectedIndex = 0
+$grpFilterFiles.Controls.Add($cmbDateField)
+
+$grpContentSearch = New-Object Windows.Forms.GroupBox
+$grpContentSearch.Text = "Search inside file contents"
+$grpContentSearch.Location = New-Object Drawing.Point(18, 298)
+$grpContentSearch.Size = New-Object Drawing.Size(1022, 120)
+$grpContentSearch.Anchor = "Top,Left,Right"
+$grpContentSearch.Visible = $false
+$form.Controls.Add($grpContentSearch)
+
+$chkRegex = New-Object System.Windows.Forms.CheckBox
+$chkRegex.Text = "Use search pattern"
+$chkRegex.Location = New-Object System.Drawing.Point(10, 25)
+$chkRegex.Size = New-Object System.Drawing.Size(155, 24)
+$chkRegex.Checked = [bool]$script:Settings.UseRegex
+$grpContentSearch.Controls.Add($chkRegex)
+
+$btnPattern = New-Object Windows.Forms.Button
+$btnPattern.Text = "Create pattern..."
+$btnPattern.Location = New-Object Drawing.Point(175, 22)
+$btnPattern.Size = New-Object Drawing.Size(125, 27)
+$grpContentSearch.Controls.Add($btnPattern)
+
+$chkCase = New-Object System.Windows.Forms.CheckBox
+$chkCase.Text = "Case sensitive"
+$chkCase.Location = New-Object System.Drawing.Point(315, 25)
+$chkCase.Size = New-Object System.Drawing.Size(135, 24)
+$chkCase.Checked = [bool]$script:Settings.CaseSensitive
+$grpContentSearch.Controls.Add($chkCase)
+
+$chkSimilar = New-Object Windows.Forms.CheckBox
+$chkSimilar.Text = "Include close spelling matches"
+$chkSimilar.Location = New-Object Drawing.Point(460, 25)
+$chkSimilar.Size = New-Object Drawing.Size(220, 24)
+$chkSimilar.Checked = [bool]$script:Settings.SimilarSpelling
+$grpContentSearch.Controls.Add($chkSimilar)
+
+$chkOtherText = New-Object Windows.Forms.CheckBox
+$chkOtherText.Text = "Try other readable file types"
+$chkOtherText.Location = New-Object Drawing.Point(690, 25)
+$chkOtherText.Size = New-Object Drawing.Size(220, 24)
+$chkOtherText.Checked = [bool]$script:Settings.TryOtherTextTypes
+$grpContentSearch.Controls.Add($chkOtherText)
+
+$lblMatchMode = New-Object Windows.Forms.Label
+$lblMatchMode.Text = "Words must match"
+$lblMatchMode.Location = New-Object Drawing.Point(10, 63)
+$lblMatchMode.AutoSize = $true
+$grpContentSearch.Controls.Add($lblMatchMode)
+
+$cmbMatchMode = New-Object Windows.Forms.ComboBox
+$cmbMatchMode.Location = New-Object Drawing.Point(140, 59)
+$cmbMatchMode.Size = New-Object Drawing.Size(145, 25)
+$cmbMatchMode.DropDownStyle = "DropDownList"
+[void]$cmbMatchMode.Items.AddRange(@("Exact phrase", "All words", "Any word"))
+$cmbMatchMode.SelectedIndex = 0
+$grpContentSearch.Controls.Add($cmbMatchMode)
+
+$chkContext = New-Object Windows.Forms.CheckBox
+$chkContext.Text = "Show nearby lines"
+$chkContext.Location = New-Object Drawing.Point(300, 60)
+$chkContext.Size = New-Object Drawing.Size(140, 24)
+$grpContentSearch.Controls.Add($chkContext)
+
+$numContext = New-Object Windows.Forms.NumericUpDown
+$numContext.Location = New-Object Drawing.Point(445, 59)
+$numContext.Size = New-Object Drawing.Size(52, 25)
+$numContext.Minimum = 1
+$numContext.Maximum = 10
+$numContext.Value = 2
+$numContext.Enabled = $false
+$grpContentSearch.Controls.Add($numContext)
+
+$lblContext = New-Object Windows.Forms.Label
+$lblContext.Text = "lines before and after"
+$lblContext.Location = New-Object Drawing.Point(505, 63)
+$lblContext.AutoSize = $true
+$grpContentSearch.Controls.Add($lblContext)
+
+# --- Results toolbar: filter-within-results, result count, export ---
+
+$lblFilterResults = New-Object Windows.Forms.Label
+$lblFilterResults.Text = "Filter results"
+$lblFilterResults.AutoSize = $true
+$form.Controls.Add($lblFilterResults)
+
+$txtFilterResults = New-Object Windows.Forms.TextBox
+$txtFilterResults.Size = New-Object Drawing.Size(300, 24)
+$txtFilterResults.AccessibleName = "Filter results"
+$form.Controls.Add($txtFilterResults)
+
+$lblResultCount = New-Object Windows.Forms.Label
+$lblResultCount.AutoSize = $true
+$lblResultCount.ForeColor = [Drawing.Color]::DimGray
+$form.Controls.Add($lblResultCount)
+
+$btnExport = New-Object Windows.Forms.Button
+$btnExport.Text = "Export..."
+$btnExport.Size = New-Object Drawing.Size(110, 26)
+$form.Controls.Add($btnExport)
+
+# Results
+$results = New-Object System.Windows.Forms.ListView
+$results.Location = New-Object System.Drawing.Point(18, 172)
+$results.Size = New-Object System.Drawing.Size(1022, 488)
+$results.Anchor = "Top,Bottom,Left,Right"
+$results.View = [System.Windows.Forms.View]::Details
+$results.FullRowSelect = $true
+$results.GridLines = $true
+$results.HideSelection = $false
+$results.MultiSelect = $true
+$results.AllowColumnReorder = $true
+$results.ShowItemToolTips = $true
+$results.AccessibleName = "Search results"
+[void]$results.Columns.Add("Name", 145)
+[void]$results.Columns.Add("Folder", 220)
+[void]$results.Columns.Add("Line", 55)
+[void]$results.Columns.Add("Matching text", 250)
+[void]$results.Columns.Add("Size", 75)
+[void]$results.Columns.Add("Type", 55)
+[void]$results.Columns.Add("Modified", 120)
+[void]$results.Columns.Add("Created", 120)
+$form.Controls.Add($results)
+
+# Status
+$status = New-Object System.Windows.Forms.Label
+$status.Text = "Ready. Choose a folder and type what you remember."
+$status.Location = New-Object System.Drawing.Point(18, 714)
+$status.Size = New-Object System.Drawing.Size(1022, 25)
+$status.Anchor = "Bottom,Left,Right"
+$form.Controls.Add($status)
+
+$progress = New-Object Windows.Forms.ProgressBar
+$progress.Location = New-Object Drawing.Point(18, 744)
+$progress.Size = New-Object Drawing.Size(1022, 5)
+$progress.Anchor = "Bottom,Left,Right"
+$progress.Style = "Marquee"
+$progress.Visible = $false
+$form.Controls.Add($progress)
+
+# Context menu
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+$miOpen = $menu.Items.Add("Open")
+$miFolder = $menu.Items.Add("Open containing folder")
+$miCopy = $menu.Items.Add("Copy full path")
+$miCopyLine = $menu.Items.Add("Copy matching line")
+$results.ContextMenuStrip = $menu
+
+function Set-AdvancedPanelVisible {
+    param([bool]$Show)
+    $grpFilterFiles.Visible = $Show
+    $grpContentSearch.Visible = $Show
+    $btnAdvanced.Text = if ($Show) { "Fewer options" } else { "More options" }
+    $lblHint.Visible = -not $Show
+    if ($Show) { $toolbarY = 426; $resultsY = 456; $resultsHeight = 332 }
+    else { $toolbarY = 172; $resultsY = 202; $resultsHeight = 458 }
+    $lblFilterResults.Location = New-Object Drawing.Point(18, ($toolbarY + 4))
+    $txtFilterResults.Location = New-Object Drawing.Point(120, $toolbarY)
+    $lblResultCount.Location = New-Object Drawing.Point(440, ($toolbarY + 4))
+    $btnExport.Location = New-Object Drawing.Point(930, ($toolbarY - 2))
+    $results.Location = New-Object Drawing.Point(18, $resultsY)
+    $results.Height = $resultsHeight
+}
+
+$btnBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = "Choose the folder to search"
+    $dlg.SelectedPath = $txtFolder.Text
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtFolder.Text = $dlg.SelectedPath
+    }
+})
+
+$txtFolder.Add_DragEnter({
+    param($srcObj, $e)
+    if ($e.Data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop)) { $e.Effect = [Windows.Forms.DragDropEffects]::Copy }
+    else { $e.Effect = [Windows.Forms.DragDropEffects]::None }
+})
+$txtFolder.Add_DragDrop({
+    param($srcObj, $e)
+    $paths = $e.Data.GetData([Windows.Forms.DataFormats]::FileDrop)
+    if ($paths -and $paths.Count -gt 0) {
+        $p = [string]$paths[0]
+        if (Test-Path -LiteralPath $p -PathType Container) { $txtFolder.Text = $p }
+        elseif (Test-Path -LiteralPath $p -PathType Leaf) { $txtFolder.Text = [IO.Path]::GetDirectoryName($p) }
+    }
+})
+
+$chkFrom.Add_CheckedChanged({ $dateFrom.Enabled = $chkFrom.Checked })
+$chkTo.Add_CheckedChanged({ $dateTo.Enabled = $chkTo.Checked })
+$chkContext.Add_CheckedChanged({ $numContext.Enabled = $chkContext.Checked })
+
+$btnAdvanced.Add_Click({ Set-AdvancedPanelVisible -Show (-not $grpFilterFiles.Visible) })
+
+$btnCancel.Add_Click({
+    $script:CancelRequested = $true
+    $status.Text = "Cancelling..."
+})
+
+$txtFilterResults.Add_TextChanged({ Render-Results })
+
+$results.Add_ColumnClick({
+    param($src, $e)
+    $fieldMap = @("Name", "Folder", "LineNumber", "PreviewFull", "SizeBytes", "TypeDisplay", "Modified", "Created")
+    if ($e.Column -ge $fieldMap.Count) { return }
+    $field = $fieldMap[$e.Column]
+    if ($script:SortField -eq $field) { $script:SortAscending = -not $script:SortAscending }
+    else { $script:SortField = $field; $script:SortAscending = $true }
+    Render-Results
+})
+
+$btnExport.Add_Click({
+    if ($script:AllRows.Count -eq 0) {
+        Show-Message "There are no results to export yet." "Export results" ([Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+    $dlg = New-Object Windows.Forms.SaveFileDialog
+    $dlg.Filter = "CSV file (*.csv)|*.csv|All files (*.*)|*.*"
+    $dlg.FileName = "PowerSearch-results.csv"
+    if ($dlg.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
+    try {
+        $filterText = $txtFilterResults.Text.Trim()
+        $rows = @($script:AllRows | Where-Object { Test-RowMatchesFilter -Row $_ -FilterText $filterText })
+        if ($script:SortField) { $rows = @($rows | Sort-Object -Property $script:SortField -Descending:(-not $script:SortAscending)) }
+        $rows | Select-Object @{N='Name';E={$_.Name}}, @{N='Folder';E={$_.Folder}}, @{N='Line';E={$_.LineDisplay}},
+            @{N='MatchingText';E={$_.PreviewFull}}, @{N='Size';E={$_.SizeDisplay}}, @{N='Type';E={$_.TypeDisplay}},
+            @{N='Modified';E={$_.ModifiedDisplay}}, @{N='Created';E={$_.CreatedDisplay}}, @{N='FullPath';E={$_.Path}} |
+            Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8
+        $status.Text = "Exported $($rows.Count) result(s) to $($dlg.FileName)."
+    }
+    catch {
+        Show-Message "Could not save the export file.`n`n$($_.Exception.Message)" "Export results" ([Windows.Forms.MessageBoxIcon]::Error)
+    }
+})
+
+$btnPattern.Add_Click({
+    $builder = New-Object Windows.Forms.Form
+    $builder.Text = "Create a search pattern"
+    $builder.StartPosition = "CenterParent"
+    $builder.FormBorderStyle = "FixedDialog"
+    $builder.MaximizeBox = $false
+    $builder.MinimizeBox = $false
+    $builder.ClientSize = New-Object Drawing.Size(500, 245)
+    $builder.Font = $form.Font
+
+    $intro = New-Object Windows.Forms.Label
+    $intro.Text = "Choose what you remember. PowerSearch will create the pattern for you."
+    $intro.Location = New-Object Drawing.Point(18, 18)
+    $intro.Size = New-Object Drawing.Size(460, 35)
+    $builder.Controls.Add($intro)
+
+    $kindLabel = New-Object Windows.Forms.Label
+    $kindLabel.Text = "I want to find"
+    $kindLabel.Location = New-Object Drawing.Point(18, 62)
+    $kindLabel.AutoSize = $true
+    $builder.Controls.Add($kindLabel)
+
+    $kind = New-Object Windows.Forms.ComboBox
+    $kind.Location = New-Object Drawing.Point(125, 58)
+    $kind.Size = New-Object Drawing.Size(350, 25)
+    $kind.DropDownStyle = "DropDownList"
+    [void]$kind.Items.AddRange(@(
+        "An exact word", "Words beginning with", "Words ending with",
+        "Any one of several words", "An email address", "A phone number",
+        "A date", "A whole number"
+    ))
+    $kind.SelectedIndex = 0
+    $builder.Controls.Add($kind)
+
+    $valueLabel = New-Object Windows.Forms.Label
+    $valueLabel.Text = "Word or words"
+    $valueLabel.Location = New-Object Drawing.Point(18, 103)
+    $valueLabel.AutoSize = $true
+    $builder.Controls.Add($valueLabel)
+
+    $value = New-Object Windows.Forms.TextBox
+    $value.Location = New-Object Drawing.Point(125, 99)
+    $value.Size = New-Object Drawing.Size(350, 25)
+    $builder.Controls.Add($value)
+
+    $example = New-Object Windows.Forms.Label
+    $example.Text = "For several words, separate them with commas."
+    $example.ForeColor = [Drawing.Color]::DimGray
+    $example.Location = New-Object Drawing.Point(125, 130)
+    $example.Size = New-Object Drawing.Size(350, 30)
+    $example.Visible = $false
+    $builder.Controls.Add($example)
+
+    $ok = New-Object Windows.Forms.Button
+    $ok.Text = "Use this pattern"
+    $ok.Location = New-Object Drawing.Point(245, 190)
+    $ok.Size = New-Object Drawing.Size(125, 32)
+    $builder.Controls.Add($ok)
+
+    $close = New-Object Windows.Forms.Button
+    $close.Text = "Cancel"
+    $close.Location = New-Object Drawing.Point(380, 190)
+    $close.Size = New-Object Drawing.Size(95, 32)
+    $close.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $builder.Controls.Add($close)
+    $builder.CancelButton = $close
+
+    $kind.Add_SelectedIndexChanged({
+        $needsWords = $kind.SelectedIndex -le 3
+        $value.Enabled = $needsWords
+        $valueLabel.Enabled = $needsWords
+        $example.Visible = ($kind.SelectedIndex -eq 3)
+    })
+
+    $ok.Add_Click({
+        if ($kind.SelectedIndex -le 3 -and [string]::IsNullOrWhiteSpace($value.Text)) {
+            Show-Message "Enter the word or words you want to find." "Create a search pattern" ([Windows.Forms.MessageBoxIcon]::Warning)
+            $value.Focus(); return
+        }
+        $escaped = [Text.RegularExpressions.Regex]::Escape($value.Text.Trim())
+        $made = switch ($kind.SelectedIndex) {
+            0 { "\b$escaped\b" }
+            1 { "\b$escaped\w*" }
+            2 { "\b\w*$escaped\b" }
+            3 {
+                $words = $value.Text.Split(',') | ForEach-Object { [regex]::Escape($_.Trim()) } | Where-Object { $_ }
+                "\b(?:$($words -join '|'))\b"
+            }
+            4 { '[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}' }
+            5 { '(?<!\d)(?:\+?\d[\d ()-]{6,}\d)(?!\d)' }
+            6 { '(?<!\d)(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})(?!\d)' }
+            7 { '(?<!\d)\d+(?!\d)' }
+        }
+        $txtContent.Text = $made
+        $chkRegex.Checked = $true
+        $builder.DialogResult = [Windows.Forms.DialogResult]::OK
+        $builder.Close()
+    })
+
+    $builder.AcceptButton = $ok
+    $builder.Add_Shown({ $value.Focus() })
+    [void]$builder.ShowDialog($form)
+    $builder.Dispose()
+})
+
+$btnHelp.Add_Click({
+    $msg = @"
+PowerSearch
+Developer: Das
+
+Type part of a file or folder name, words inside a file, or both. Leave a box empty
+when you do not want to filter by it. Double-click a result to open it. Drag a folder
+onto the Folder box to use it directly as the search location.
+
+The File types box accepts quick categories (Documents, Pictures, Archives, and so
+on) as well as individual extensions such as "pdf, docx". Recent searches appear in
+the File/folder name and Words dropdowns.
+
+Content search supports logs (including extensionless and actively written logs),
+common text files, DOCX, XLSX, and PPTX. Matching lines and line numbers are shown.
+Up to 20 matches are displayed per file so busy logs do not overwhelm the results.
+A "~" before a matching line means it was found through close-spelling matching
+rather than an exact match.
+
+More options lets you find an exact phrase, all entered words, or any entered word,
+and show nearby lines around each match. It does not require an index and never
+sends file names or contents anywhere. Folders are included in results when you
+search by name only, with no file type, size, or content filter (date filters
+still narrow folder results too). The From/Until date range can filter by either
+Modified or Created date -- pick which one with the "using" dropdown next to it.
+
+Results show both Modified and Created dates as separate, sortable columns. Click
+a column heading to sort results; click again to reverse the order. Use the
+Filter results box above the list to narrow down what has already been found, and
+Export to save the current results to a CSV file.
+
+PowerSearch remembers your last folder, options, and recent searches between runs,
+stored only on this PC at %APPDATA%\PowerSearch\settings.json. Nothing is ever sent
+anywhere.
+
+Close spelling matches are included by default for a single word of five or more
+letters. You can turn this off under More options.
+
+PowerSearch is a single portable file. No administrator rights are needed for
+normal searching, and it does not change Windows security settings.
+
+Keyboard: Enter searches, Esc cancels, Ctrl+C copies selected paths, and F1 opens Help.
+"@
+    Show-Message -Text $msg -Title "About PowerSearch"
+})
+
+$openSelected = {
+    if ($results.SelectedItems.Count -gt 0) {
+        $path = [string]$results.SelectedItems[0].Tag.Path
+        if (Test-Path -LiteralPath $path) {
+            try { Start-Process -FilePath $path -ErrorAction Stop }
+            catch { Show-Message "Windows could not open this item.`n`n$($_.Exception.Message)" "Unable to open" ([Windows.Forms.MessageBoxIcon]::Warning) }
+        }
+    }
+}
+
+$miOpen.Add_Click($openSelected)
+$results.Add_DoubleClick($openSelected)
+
+$miFolder.Add_Click({
+    if ($results.SelectedItems.Count -gt 0) {
+        $path = [string]$results.SelectedItems[0].Tag.Path
+        if (Test-Path -LiteralPath $path) {
+            Start-Process explorer.exe -ArgumentList "/select,`"$path`""
+        }
+    }
+})
+
+$miCopy.Add_Click({
+    if ($results.SelectedItems.Count -gt 0) {
+        $paths = @($results.SelectedItems | ForEach-Object { [string]$_.Tag.Path })
+        [System.Windows.Forms.Clipboard]::SetText(($paths -join [Environment]::NewLine))
+        $status.Text = "Copied $($paths.Count) path(s)."
+    }
+})
+
+$miCopyLine.Add_Click({
+    if ($results.SelectedItems.Count -gt 0) {
+        $lines = @($results.SelectedItems | ForEach-Object { [string]$_.Tag.MatchLine } | Where-Object { $_ })
+        if ($lines.Count -gt 0) {
+            [Windows.Forms.Clipboard]::SetText(($lines -join [Environment]::NewLine))
+            $status.Text = "Copied $($lines.Count) matching line(s)."
+        } else { $status.Text = "The selected result does not have a matching line." }
+    }
+})
+
+$btnSearch.Add_Click({
+    $root = $txtFolder.Text.Trim()
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        Show-Message -Text "Please choose a valid folder." -Icon ([System.Windows.Forms.MessageBoxIcon]::Warning)
+        return
+    }
+
+    # Remember this search immediately so it is available even if the user closes without another search.
+    if ($txtName.Text -and ($txtName.Items -notcontains $txtName.Text)) { [void]$txtName.Items.Insert(0, $txtName.Text) }
+    if ($txtContent.Text -and ($txtContent.Items -notcontains $txtContent.Text)) { [void]$txtContent.Items.Insert(0, $txtContent.Text) }
+
+    $namePattern = $txtName.Text.Trim()
+    $useCreatedDate = $cmbDateField.Text -eq "Created"
+
+    $extensions = @()
+    $typeText = $txtExt.Text.Trim()
+    $typeValues = switch ($typeText) {
+        "All files"       { "" }
+        "Documents"       { "doc,docx,pdf,rtf,odt" }
+        "Spreadsheets"    { "xls,xlsx,csv,tsv,ods" }
+        "Presentations"   { "ppt,pptx,odp" }
+        "Pictures"        { "jpg,jpeg,png,gif,bmp,tif,tiff,webp,heic,svg" }
+        "Audio and video" { "mp3,wav,m4a,flac,mp4,mov,avi,mkv,wmv" }
+        "Web pages"       { "html,htm,url,css,js" }
+        "Text and notes"  { "txt,md,log,ini,rtf" }
+        "Archives"        { "zip,7z,rar,gz,tar" }
+        default            { $typeText }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($typeValues)) {
+        $extensions = $typeValues.Split(@(',', ';', ' '), [StringSplitOptions]::RemoveEmptyEntries) |
+            ForEach-Object { $_.Trim().TrimStart(".").ToLowerInvariant() } |
+            Where-Object { $_ }
+    }
+
+    $excluded = @()
+    if (-not [string]::IsNullOrWhiteSpace($txtExclude.Text)) {
+        $excluded = $txtExclude.Text.Split(",") |
+            ForEach-Object { $_.Trim().ToLowerInvariant() } |
+            Where-Object { $_ }
+    }
+
+    if ($chkRegex.Checked -and -not [string]::IsNullOrWhiteSpace($txtContent.Text)) {
+        try { [void][Text.RegularExpressions.Regex]::IsMatch("", $txtContent.Text) }
+        catch {
+            Show-Message -Text "The advanced text pattern is not valid. Please correct it and try again." -Icon ([Windows.Forms.MessageBoxIcon]::Warning)
+            $txtContent.Focus(); return
+        }
+    }
+
+    $minBytes = $null
+    $maxBytes = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($txtMinSize.Text)) {
+        $n = 0.0
+        if (-not [double]::TryParse($txtMinSize.Text, [ref]$n)) {
+            Show-Message -Text "Min MB must be a number." -Icon ([System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+        $minBytes = [long]($n * 1MB)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($txtMaxSize.Text)) {
+        $n = 0.0
+        if (-not [double]::TryParse($txtMaxSize.Text, [ref]$n)) {
+            Show-Message -Text "Max MB must be a number." -Icon ([System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+        $maxBytes = [long]($n * 1MB)
+    }
+
+    $results.Items.Clear()
+    $script:AllRows = New-Object Collections.Generic.List[object]
+    $script:SortField = $null
+    $script:SortAscending = $true
+    $txtFilterResults.Text = ""
+    $lblResultCount.Text = ""
+    $script:CancelRequested = $false
+    $btnSearch.Enabled = $false
+    $btnCancel.Enabled = $true
+    $form.UseWaitCursor = $true
+    $progress.Visible = $true
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+
+    $matched = 0
+    $scanned = 0
+    $skippedErrors = 0
+    $contentUnsupported = 0
+    $filesWithMatches = 0
+    $truncatedFiles = 0
+    $limitReached = $false
+    $script:RegexTimeoutCount = 0
+
+    try {
+        # Safe folder traversal compatible with Windows PowerShell 5.1 / .NET Framework.
+        # It skips inaccessible folders instead of aborting the whole search. Loop
+        # protection uses a visited-folder set rather than excluding reparse points,
+        # because cloud-sync placeholders (OneDrive, Dropbox, Google Drive) are also
+        # marked as reparse points and are ordinary folders that must still be searched.
+        # The visited set only catches an exact repeated path, not a symlink/junction
+        # cycle (each pass through the link produces a longer, never-before-seen path),
+        # so a hard depth backstop below is what actually stops those loops.
+        $maxFolderDepth = 60
+        $depthLimitSkipped = 0
+        $visitedFolders = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $folders = New-Object System.Collections.Stack
+        $rootDir = New-Object System.IO.DirectoryInfo($root)
+        [void]$visitedFolders.Add($rootDir.FullName)
+        $folders.Push([pscustomobject]@{ Dir = $rootDir; Depth = 0 })
+
+        while ($folders.Count -gt 0 -and -not $script:CancelRequested -and -not $limitReached) {
+            $currentEntry = $folders.Pop()
+            $currentDir = [System.IO.DirectoryInfo]$currentEntry.Dir
+            $currentDepth = $currentEntry.Depth
+
+            # Folder names are useful results too. A folder is a candidate whenever the
+            # active filters are all things a folder can actually have: a name, and
+            # optionally a modified-date range. File type, size, and content filters
+            # rule folders out because they do not apply to folders.
+            $folderCandidate = [string]::IsNullOrWhiteSpace($txtContent.Text) -and $extensions.Count -eq 0 -and
+                $null -eq $minBytes -and $null -eq $maxBytes
+            if ($folderCandidate -and -not [string]::IsNullOrWhiteSpace($namePattern) -and $currentDir.FullName -ne $root) {
+                $folderMatches = if ($chkNamePattern.Checked) { $currentDir.Name -like $namePattern } else { $currentDir.Name.IndexOf($namePattern, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+                $folderFilterDate = if ($useCreatedDate) { $currentDir.CreationTime } else { $currentDir.LastWriteTime }
+                if ($folderMatches -and
+                    (-not $chkFrom.Checked -or $folderFilterDate.Date -ge $dateFrom.Value.Date) -and
+                    (-not $chkTo.Checked -or $folderFilterDate.Date -le $dateTo.Value.Date)) {
+                    Add-ResultRow $currentDir; $matched++
+                    if ($matched -ge 5000) { $limitReached = $true; continue }
+                }
+            }
+
+            try {
+                $dirFiles = $currentDir.GetFiles()
+            }
+            catch {
+                $skippedErrors++
+                continue
+            }
+
+            foreach ($fi in $dirFiles) {
+                if ($script:CancelRequested) { break }
+
+                $scanned++
+                if (($scanned % 75) -eq 0) {
+                    $status.Text = "Scanned $scanned files - $matched matches"
+                    $lblResultCount.Text = "$($script:AllRows.Count) result(s)"
+                    [System.Windows.Forms.Application]::DoEvents()
+                }
+
+                try {
+
+                # Excluded folder names
+                if ($excluded.Count -gt 0) {
+                    $relative = $fi.DirectoryName.Substring($root.TrimEnd('\').Length).TrimStart('\')
+                    if ($relative) {
+                        $parts = $relative.Split('\')
+                        $skip = $false
+                        foreach ($part in $parts) {
+                            if ($excluded -contains $part.ToLowerInvariant()) {
+                                $skip = $true
+                                break
+                            }
+                        }
+                        if ($skip) { continue }
+                    }
+                }
+
+                # Ordinary searches match any part of the name. Wildcards are opt-in.
+                if (-not [string]::IsNullOrWhiteSpace($namePattern)) {
+                    $nameMatches = if ($chkNamePattern.Checked) { $fi.Name -like $namePattern } else { $fi.Name.IndexOf($namePattern, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+                    if (-not $nameMatches) { continue }
+                }
+
+                # Extension filter
+                if ($extensions.Count -gt 0) {
+                    $ext = $fi.Extension.TrimStart(".").ToLowerInvariant()
+                    if ($extensions -notcontains $ext) { continue }
+                }
+
+                # Size
+                if ($null -ne $minBytes -and $fi.Length -lt $minBytes) { continue }
+                if ($null -ne $maxBytes -and $fi.Length -gt $maxBytes) { continue }
+
+                # Modified/Created date range (per the "using" dropdown)
+                if ($chkFrom.Checked -or $chkTo.Checked) {
+                    $fileFilterDate = if ($useCreatedDate) { $fi.CreationTime } else { $fi.LastWriteTime }
+                    if ($chkFrom.Checked -and $fileFilterDate.Date -lt $dateFrom.Value.Date) { continue }
+                    if ($chkTo.Checked -and $fileFilterDate.Date -gt $dateTo.Value.Date) { continue }
+                }
+
+                # Content
+                if (-not [string]::IsNullOrWhiteSpace($txtContent.Text)) {
+                    $contentExt = $fi.Extension.ToLowerInvariant()
+                    if ([string]::IsNullOrEmpty($contentExt)) {
+                        # Extensionless files (logs, Dockerfile, README, ...) are searched
+                        # by default, but must still pass the same byte-sniff used for
+                        # unknown extensions -- a genuine binary with no extension should
+                        # not be scanned as if it were text.
+                        if (-not (Test-LikelyTextFile $fi)) { $contentUnsupported++; continue }
+                    }
+                    else {
+                        $knownText = ($script:TextExtensions + $script:OfficeExtensions) -contains $contentExt
+                        if (-not $knownText -and (-not $chkOtherText.Checked -or -not (Test-LikelyTextFile $fi))) {
+                            $contentUnsupported++
+                            continue
+                        }
+                    }
+                    $contextCount = if ($chkContext.Checked) { [int]$numContext.Value } else { 0 }
+                    $contentMatches = @(Find-FileContentMatches -File $fi -Pattern $txtContent.Text `
+                        -UseRegex $chkRegex.Checked -CaseSensitive $chkCase.Checked `
+                        -MatchMode $cmbMatchMode.Text -SimilarSpelling $chkSimilar.Checked `
+                        -ContextLines $contextCount -MaximumMatches 20)
+                    if ($contentMatches.Count -eq 0) { continue }
+                    $filesWithMatches++
+                    foreach ($contentMatch in $contentMatches) {
+                        Add-ResultRow -File $fi -LineNumber $contentMatch.LineNumber `
+                            -Preview $contentMatch.Preview -MatchLine $contentMatch.MatchLine
+                        $matched++
+                        if ($matched -ge 5000) { $limitReached = $true; break }
+                    }
+                    if ($contentMatches.Count -ge 20) { $truncatedFiles++ }
+                    if ($limitReached) { break }
+                    continue
+                }
+
+                Add-ResultRow -File $fi
+                $matched++
+
+                if ($matched -ge 5000) {
+                    $status.Text = "Stopped at 5,000 results. Narrow the search for more precise results."
+                    $limitReached = $true
+                    break
+                }
+                }
+                catch {
+                    $skippedErrors++
+                }
+            }
+
+            if ($chkSubfolders.Checked -and -not $script:CancelRequested) {
+                try {
+                    foreach ($subdir in $currentDir.GetDirectories()) {
+                        if ($excluded.Count -gt 0 -and ($excluded -contains $subdir.Name.ToLowerInvariant())) {
+                            continue
+                        }
+
+                        # An exact repeated path (e.g. a hardlinked directory reached two
+                        # ways) is skipped here. A symlink/junction cycle is not caught by
+                        # this check -- each pass through the link produces a new, longer
+                        # path -- so the depth cap below is the real backstop for that case.
+                        if (-not $visitedFolders.Add($subdir.FullName)) { continue }
+
+                        if ($currentDepth -ge $maxFolderDepth) { $depthLimitSkipped++; continue }
+
+                        $folders.Push([pscustomobject]@{ Dir = $subdir; Depth = $currentDepth + 1 })
+                    }
+                }
+                catch {
+                    $skippedErrors++
+                }
+            }
+        }
+
+        $elapsed = " ($([Math]::Round($sw.Elapsed.TotalSeconds, 1))s)"
+        if ($script:CancelRequested) {
+            $status.Text = "Cancelled. $matched matches from $scanned files scanned.$elapsed"
+        }
+        elseif ($limitReached) {
+            $status.Text += $elapsed
+        }
+        else {
+            $status.Text = "Done. $matched matches from $scanned files scanned."
+            if ($filesWithMatches -gt 0) { $status.Text = "Done. $matched matching lines in $filesWithMatches files ($scanned files checked)." }
+            if ($matched -eq 0) {
+                if ($scanned -eq 0) {
+                    $status.Text = "No files were found in '$root'. Choose the folder that contains your file."
+                } else {
+                    $status.Text = "No matches in $scanned files under '$root'. Check the folder or try fewer words."
+                }
+            }
+            if ($skippedErrors -gt 0) {
+                $status.Text += " $skippedErrors inaccessible/problem files skipped."
+            }
+            if ($contentUnsupported -gt 0) {
+                $status.Text += " $contentUnsupported files of unsupported types were not opened."
+            }
+            if ($truncatedFiles -gt 0) {
+                $status.Text += " Showing the first 20 matches in $truncatedFiles heavily-matching file(s)."
+            }
+            if ($depthLimitSkipped -gt 0) {
+                $status.Text += " $depthLimitSkipped folder(s) skipped past a $maxFolderDepth-level depth limit (possible symlink loop)."
+            }
+            if ($script:RegexTimeoutCount -gt 0) {
+                $status.Text += " $($script:RegexTimeoutCount) line(s) skipped because the pattern took too long against them."
+            }
+            $status.Text += $elapsed
+        }
+        $lblResultCount.Text = if ($script:AllRows.Count -eq 0) { "" } else { "$($script:AllRows.Count) result(s)" }
+    }
+    catch {
+        Show-Message -Text $_.Exception.Message -Title "Search error" -Icon ([System.Windows.Forms.MessageBoxIcon]::Error)
+        $status.Text = "Search failed."
+    }
+    finally {
+        $btnSearch.Enabled = $true
+        $btnCancel.Enabled = $false
+        $form.UseWaitCursor = $false
+        $progress.Visible = $false
+    }
+})
+
+$form.Add_FormClosing({
+    $s = $script:Settings
+    $s.Folder = $txtFolder.Text
+    $s.NameHistory = Add-HistoryEntry -History $txtName.Items -Entry $txtName.Text
+    $s.ContentHistory = Add-HistoryEntry -History $txtContent.Items -Entry $txtContent.Text
+    $s.ExtensionText = $txtExt.Text
+    $s.IncludeSubfolders = $chkSubfolders.Checked
+    $s.AdvancedVisible = $grpFilterFiles.Visible
+    $s.ExcludeFolders = $txtExclude.Text
+    $s.UseRegex = $chkRegex.Checked
+    $s.CaseSensitive = $chkCase.Checked
+    $s.UseNameWildcards = $chkNamePattern.Checked
+    $s.SimilarSpelling = $chkSimilar.Checked
+    $s.MatchMode = $cmbMatchMode.Text
+    $s.ShowContext = $chkContext.Checked
+    $s.ContextLines = [int]$numContext.Value
+    $s.TryOtherTextTypes = $chkOtherText.Checked
+    $s.DateFilterField = $cmbDateField.Text
+    Save-Settings -Settings $s
+})
+
+# Allow Enter from search fields
+$form.Add_KeyDown({
+    if ($_.KeyCode -eq [Windows.Forms.Keys]::Escape -and $btnCancel.Enabled) { $btnCancel.PerformClick(); $_.SuppressKeyPress = $true }
+    elseif ($_.KeyCode -eq [Windows.Forms.Keys]::F1) { $btnHelp.PerformClick(); $_.SuppressKeyPress = $true }
+    elseif ($_.Control -and $_.KeyCode -eq [Windows.Forms.Keys]::C -and $results.Focused) { $miCopy.PerformClick(); $_.SuppressKeyPress = $true }
+    elseif ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter -and $btnSearch.Enabled) {
+        $btnSearch.PerformClick()
+    }
+})
+$form.KeyPreview = $true
+
+# Restore match-mode selection and advanced-panel layout from saved settings.
+$idx = $cmbMatchMode.Items.IndexOf($script:Settings.MatchMode)
+if ($idx -ge 0) { $cmbMatchMode.SelectedIndex = $idx }
+$dateFieldIdx = $cmbDateField.Items.IndexOf($script:Settings.DateFilterField)
+if ($dateFieldIdx -ge 0) { $cmbDateField.SelectedIndex = $dateFieldIdx }
+$chkContext.Checked = [bool]$script:Settings.ShowContext
+if ($script:Settings.ContextLines) {
+    $clamped = [Math]::Max($numContext.Minimum, [Math]::Min($numContext.Maximum, [int]$script:Settings.ContextLines))
+    $numContext.Value = $clamped
+}
+Set-AdvancedPanelVisible -Show ([bool]$script:Settings.AdvancedVisible)
+
+[void]$form.ShowDialog()
