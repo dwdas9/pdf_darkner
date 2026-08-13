@@ -1,7 +1,29 @@
 @echo off
+rem ============================================================================
+rem PowerSearch - portable Windows file-name and file-content search application
+rem Architecture/concept: D Das (December 2025, as recorded by the project owner)
+rem Implementation history: maintained in this repository's Git commits
+rem
+rem HOW THIS HYBRID FILE STARTS
+rem   1. cmd.exe runs only this small batch-language launcher.
+rem   2. The launcher stores this file's absolute path in POWERSEARCH_SELF.
+rem   3. PowerShell reads the same file, finds the final #PS-BEGIN marker, and
+rem      evaluates everything after it as PowerShell.
+rem   4. -NoProfile avoids machine-specific profile code and -STA supplies the
+rem      single-threaded apartment required by Windows Forms and the clipboard.
+rem
+rem USAGE
+rem   Double-click PowerSearch.cmd, or run it from Command Prompt. No arguments,
+rem   installation, administrator access, or search index are required.
+rem ============================================================================
 setlocal
+rem %~f0 expands to the fully-qualified path of the currently running script.
 set "POWERSEARCH_SELF=%~f0"
+rem '#' is not a batch comment marker. cmd.exe reaches the PowerShell call below,
+rem while PowerShell deliberately extracts and executes the section after the
+rem marker. LastIndexOf prevents an explanatory mention above from being used.
 powershell.exe -NoProfile -STA -Command "$s=[IO.File]::ReadAllText($env:POWERSEARCH_SELF); $m=[char]35+'PS-BEGIN'; $i=$s.LastIndexOf($m); if($i -lt 0){throw 'Embedded PowerShell section not found'}; iex $s.Substring($i+$m.Length)"
+rem Error 9009 is cmd.exe's conventional "program/command not found" result.
 if "%errorlevel%"=="9009" (
   echo PowerShell is not available on this Windows machine.
   pause
@@ -10,6 +32,27 @@ if "%errorlevel%"=="9009" (
 exit /b
 
 #PS-BEGIN
+# ============================================================================
+# Embedded PowerShell application
+#
+# Purpose
+#   Search a selected folder tree by file/folder name, content, extension, size,
+#   and Modified/Created date. Results can be filtered, sorted, opened, copied,
+#   and exported to CSV. Text and extensionless files are supported, as are the
+#   XML text parts of DOCX, XLSX, and PPTX files.
+#
+# Privacy and persistence
+#   Searches are performed locally. The application sends no data anywhere.
+#   Only preferences and recent search terms are stored, in
+#   %APPDATA%\PowerSearch\settings.json.
+#
+# Safety/performance boundaries
+#   Results stop at 5,000; content matches stop at 20 per file; regex evaluation
+#   has a two-second timeout per line; recursion stops after 60 levels; and
+#   cloud-only placeholders are not opened because doing so would download them.
+# ============================================================================
+
+# Load the desktop UI, drawing, and ZIP-reading libraries used by the app.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -18,7 +61,14 @@ try { [void][System.Windows.Forms.Application]::SetHighDpiMode([System.Windows.F
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
+# ---- Application-wide state and supported file types ------------------------
+# script: scope lets UI event handlers and helper functions share this state.
 $script:CancelRequested = $false
+# Set when the window is closed while a search is still running: the close is
+# deferred (see Add_FormClosing) until the search loop actually stops, then
+# replayed. Without this, closing mid-search disposes the form's controls out
+# from under the still-running loop instead of stopping it.
+$script:ClosePending = $false
 $script:TextExtensions = @(
     ".txt",".log",".csv",".tsv",".json",".xml",".yaml",".yml",
     ".ini",".cfg",".conf",".md",".rtf",".url",".reg",".ps1",".psm1",".psd1",".bat",".cmd",
@@ -34,6 +84,7 @@ $script:RegexTimeoutCount = 0
 $script:SettingsDir = Join-Path $env:APPDATA "PowerSearch"
 $script:SettingsPath = Join-Path $script:SettingsDir "settings.json"
 
+# Display a consistently branded informational, warning, or error dialog.
 function Show-Message {
     param(
         [string]$Text,
@@ -47,6 +98,8 @@ function Show-Message {
     ) | Out-Null
 }
 
+# Load saved preferences over safe defaults. Missing, obsolete, or malformed
+# properties are ignored so an older settings file cannot prevent startup.
 function Get-Settings {
     $default = [pscustomobject]@{
         Folder            = [Environment]::GetFolderPath("MyDocuments")
@@ -77,6 +130,8 @@ function Get-Settings {
     return $default
 }
 
+# Persist user preferences as local JSON. Failure is intentionally non-fatal:
+# searching should still work when the profile directory is read-only.
 function Save-Settings {
     param($Settings)
     try {
@@ -85,6 +140,7 @@ function Save-Settings {
     } catch { }
 }
 
+# Put a nonblank search at the front of a de-duplicated, size-limited history.
 function Add-HistoryEntry {
     param([string[]]$History, [string]$Entry, [int]$Max = 15)
     if ([string]::IsNullOrWhiteSpace($Entry)) { return @($History) }
@@ -97,6 +153,8 @@ function Add-HistoryEntry {
 
 $script:Settings = Get-Settings
 
+# Extract human-readable XML text from Office Open XML ZIP packages. This is a
+# lightweight text search, not a full Word/Excel/PowerPoint rendering engine.
 function Get-OpenXmlText {
     param([string]$Path)
     $zip = $null
@@ -130,6 +188,24 @@ function Get-OpenXmlText {
     }
 }
 
+# Detect online-only cloud placeholders without opening or hydrating the file.
+function Test-IsCloudPlaceholder {
+    param([System.IO.FileInfo]$File)
+    # OneDrive/Dropbox/Google Drive "Files On-Demand" mark a file that has not been
+    # downloaded to this PC with these Cloud Files API attributes. Opening or reading
+    # such a file forces Windows to download it first -- for a large file or a slow
+    # connection that can take a very long time, and being one single blocking .NET
+    # call, Cancel cannot interrupt it once it has started. Checking Attributes is
+    # metadata already returned by folder enumeration, so this costs no extra I/O
+    # and never triggers a download itself.
+    $RecallOnOpen = 0x00040000
+    $RecallOnDataAccess = 0x00400000
+    $attr = [int]$File.Attributes
+    return (($attr -band $RecallOnOpen) -ne 0) -or (($attr -band $RecallOnDataAccess) -ne 0)
+}
+
+# Decide whether an unknown/extensionless file is probably text by sampling its
+# first bytes. Alternating NUL bytes are allowed because they indicate UTF-16.
 function Test-LikelyTextFile {
     param([IO.FileInfo]$File)
     if ($script:TextExtensions -contains $File.Extension.ToLowerInvariant() -or
@@ -156,6 +232,8 @@ function Test-LikelyTextFile {
     finally { if ($stream) { $stream.Dispose() } }
 }
 
+# Search one file and return structured line matches. Handles ordinary phrases,
+# all/any-word modes, regex, simple one-deletion fuzzy matches, and context lines.
 function Find-FileContentMatches {
     param(
         [IO.FileInfo]$File,
@@ -264,6 +342,7 @@ function Find-FileContentMatches {
     }
 }
 
+# Convert a byte count into a compact, human-readable value for the UI.
 function Format-Size {
     param([long]$Bytes)
     if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
@@ -272,6 +351,8 @@ function Format-Size {
     return "$Bytes B"
 }
 
+# Normalize file/folder metadata and optional content-match data into the single
+# row model used by filtering, sorting, display, opening, and CSV export.
 function New-ResultRow {
     param(
         [System.IO.FileSystemInfo]$File,
@@ -308,6 +389,7 @@ function New-ResultRow {
     }
 }
 
+# Convert the internal row model into the columns displayed by the ListView.
 function New-ResultListViewItem {
     param($Row)
     $item = New-Object System.Windows.Forms.ListViewItem($Row.Name)
@@ -323,6 +405,7 @@ function New-ResultListViewItem {
     return $item
 }
 
+# Apply the live "Filter shown results" text to already-found result rows.
 function Test-RowMatchesFilter {
     param($Row, [string]$FilterText)
     if ([string]::IsNullOrWhiteSpace($FilterText)) { return $true }
@@ -331,6 +414,8 @@ function Test-RowMatchesFilter {
            ($Row.PreviewFull.IndexOf($FilterText, [StringComparison]::OrdinalIgnoreCase) -ge 0)
 }
 
+# Rebuild the visible list from the complete result set, applying the current
+# display filter and selected sort column without rerunning the disk search.
 function Render-Results {
     $filterText = $txtFilterResults.Text.Trim()
     # Windows PowerShell 5.1 has a DLR binder bug where wrapping a
@@ -356,6 +441,7 @@ function Render-Results {
         else { "$shown of $($script:AllRows.Count) result(s)" }
 }
 
+# Add one normalized result to the master collection and visible result list.
 function Add-ResultRow {
     param(
         [System.IO.FileSystemInfo]$File,
@@ -368,6 +454,7 @@ function Add-ResultRow {
     [void]$results.Items.Add((New-ResultListViewItem $row))
 }
 
+# ---- Main window and search controls ----------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "PowerSearch"
 $form.StartPosition = "CenterScreen"
@@ -726,9 +813,21 @@ $form.Controls.Add($results)
 $status = New-Object System.Windows.Forms.Label
 $status.Text = "Ready. Choose a folder and type what you remember."
 $status.Location = New-Object System.Drawing.Point(18, 714)
-$status.Size = New-Object System.Drawing.Size(1022, 25)
+$status.Size = New-Object System.Drawing.Size(852, 25)
 $status.Anchor = "Bottom,Left,Right"
 $form.Controls.Add($status)
+
+# Live resource usage, so it is visible whether a search is actually heavy on
+# CPU/RAM or just waiting on slow disk/network -- and by how much.
+$lblResourceUsage = New-Object System.Windows.Forms.Label
+$lblResourceUsage.Text = ""
+$lblResourceUsage.TextAlign = [Drawing.ContentAlignment]::MiddleRight
+$lblResourceUsage.ForeColor = [Drawing.Color]::DimGray
+$lblResourceUsage.Location = New-Object System.Drawing.Point(880, 714)
+$lblResourceUsage.Size = New-Object System.Drawing.Size(160, 25)
+$lblResourceUsage.Anchor = "Bottom,Right"
+$lblResourceUsage.AccessibleName = "CPU and memory usage"
+$form.Controls.Add($lblResourceUsage)
 
 $progress = New-Object Windows.Forms.ProgressBar
 $progress.Location = New-Object Drawing.Point(18, 744)
@@ -738,6 +837,7 @@ $progress.Style = "Marquee"
 $progress.Visible = $false
 $form.Controls.Add($progress)
 
+# ---- Result actions and event wiring ----------------------------------------
 # Context menu
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $miOpen = $menu.Items.Add("Open")
@@ -746,6 +846,8 @@ $miCopy = $menu.Items.Add("Copy full path")
 $miCopyLine = $menu.Items.Add("Copy matching line")
 $results.ContextMenuStrip = $menu
 
+# Expand/collapse advanced controls and resize/reposition the result area so the
+# basic interface remains uncluttered when those controls are hidden.
 function Set-AdvancedPanelVisible {
     param([bool]$Show)
     $grpFilterFiles.Visible = $Show
@@ -762,6 +864,7 @@ function Set-AdvancedPanelVisible {
     $results.Height = $resultsHeight
 }
 
+# Choose the search root with the standard Windows folder picker.
 $btnBrowse.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
     $dlg.Description = "Choose the folder to search"
@@ -771,6 +874,7 @@ $btnBrowse.Add_Click({
     }
 })
 
+# Permit a folder dragged from Explorer to become the search root.
 $txtFolder.Add_DragEnter({
     param($srcObj, $e)
     if ($e.Data.GetDataPresent([Windows.Forms.DataFormats]::FileDrop)) { $e.Effect = [Windows.Forms.DragDropEffects]::Copy }
@@ -786,12 +890,14 @@ $txtFolder.Add_DragDrop({
     }
 })
 
+# Keep dependent inputs enabled only while their corresponding option is active.
 $chkFrom.Add_CheckedChanged({ $dateFrom.Enabled = $chkFrom.Checked })
 $chkTo.Add_CheckedChanged({ $dateTo.Enabled = $chkTo.Checked })
 $chkContext.Add_CheckedChanged({ $numContext.Enabled = $chkContext.Checked })
 
 $btnAdvanced.Add_Click({ Set-AdvancedPanelVisible -Show (-not $grpFilterFiles.Visible) })
 
+# Cancellation is cooperative: lengthy loops check this flag between items.
 $btnCancel.Add_Click({
     $script:CancelRequested = $true
     $status.Text = "Cancelling..."
@@ -799,6 +905,7 @@ $btnCancel.Add_Click({
 
 $txtFilterResults.Add_TextChanged({ Render-Results })
 
+# Clicking a column selects it for sorting; clicking it again reverses direction.
 $results.Add_ColumnClick({
     param($src, $e)
     $fieldMap = @("Name", "Folder", "LineNumber", "PreviewFull", "SizeBytes", "TypeDisplay", "Modified", "Created")
@@ -809,6 +916,8 @@ $results.Add_ColumnClick({
     Render-Results
 })
 
+# Export the currently displayed (already filtered/sorted) rows to a CSV chosen
+# by the user. Export does not silently overwrite a predetermined file.
 $btnExport.Add_Click({
     if ($script:AllRows.Count -eq 0) {
         Show-Message "There are no results to export yet." "Export results" ([Windows.Forms.MessageBoxIcon]::Information)
@@ -833,6 +942,8 @@ $btnExport.Add_Click({
     }
 })
 
+# Open a small regex builder that produces common patterns without requiring the
+# user to remember regular-expression syntax.
 $btnPattern.Add_Click({
     $builder = New-Object Windows.Forms.Form
     $builder.Text = "Create a search pattern"
@@ -938,6 +1049,7 @@ $btnPattern.Add_Click({
     $builder.Dispose()
 })
 
+# Show an in-application quick reference for controls, shortcuts, and limits.
 $btnHelp.Add_Click({
     $msg = @"
 PowerSearch
@@ -956,6 +1068,13 @@ common text files, DOCX, XLSX, and PPTX. Matching lines and line numbers are sho
 Up to 20 matches are displayed per file so busy logs do not overwhelm the results.
 A "~" before a matching line means it was found through close-spelling matching
 rather than an exact match.
+
+Content search never downloads a file that OneDrive, Dropbox, or Google Drive
+has not already saved to this PC -- those are skipped instead, and counted in
+the status line. Opening a not-yet-downloaded file would force it to download
+first, which can take a long time and, once started, cannot be stopped by
+Cancel. Name/size/date search still finds these files normally; only reading
+their contents is skipped.
 
 More options lets you find an exact phrase, all entered words, or any entered word,
 and show nearby lines around each match. It does not require an index and never
@@ -994,9 +1113,11 @@ $openSelected = {
     }
 }
 
+# Double-click/Open launches a result with its registered Windows application.
 $miOpen.Add_Click($openSelected)
 $results.Add_DoubleClick($openSelected)
 
+# Open Explorer with a file selected, or open the folder itself for folder rows.
 $miFolder.Add_Click({
     if ($results.SelectedItems.Count -gt 0) {
         $path = [string]$results.SelectedItems[0].Tag.Path
@@ -1006,6 +1127,7 @@ $miFolder.Add_Click({
     }
 })
 
+# Copy selected paths as newline-separated plain text.
 $miCopy.Add_Click({
     if ($results.SelectedItems.Count -gt 0) {
         $paths = @($results.SelectedItems | ForEach-Object { [string]$_.Tag.Path })
@@ -1014,6 +1136,7 @@ $miCopy.Add_Click({
     }
 })
 
+# Copy the matched line when a content-search result is selected.
 $miCopyLine.Add_Click({
     if ($results.SelectedItems.Count -gt 0) {
         $lines = @($results.SelectedItems | ForEach-Object { [string]$_.Tag.MatchLine } | Where-Object { $_ })
@@ -1024,6 +1147,10 @@ $miCopyLine.Add_Click({
     }
 })
 
+# ---- Search pipeline ---------------------------------------------------------
+# Validate input, save the current options, enumerate folders iteratively, apply
+# inexpensive metadata filters before content reads, collect matches, and keep
+# the UI responsive with periodic event processing and cancellation checks.
 $btnSearch.Add_Click({
     $root = $txtFolder.Text.Trim()
     if (-not (Test-Path -LiteralPath $root -PathType Container)) {
@@ -1114,6 +1241,7 @@ $btnSearch.Add_Click({
     $filesWithMatches = 0
     $truncatedFiles = 0
     $limitReached = $false
+    $cloudSkipped = 0
     $script:RegexTimeoutCount = 0
 
     try {
@@ -1216,6 +1344,10 @@ $btnSearch.Add_Click({
 
                 # Content
                 if (-not [string]::IsNullOrWhiteSpace($txtContent.Text)) {
+                    # Never open a file OneDrive/Dropbox/Google Drive hasn't downloaded
+                    # yet -- doing so forces a download that Cancel cannot interrupt.
+                    # See Test-IsCloudPlaceholder for why this check is safe/free.
+                    if (Test-IsCloudPlaceholder $fi) { $cloudSkipped++; continue }
                     $contentExt = $fi.Extension.ToLowerInvariant()
                     if ([string]::IsNullOrEmpty($contentExt)) {
                         # Extensionless files (logs, Dockerfile, README, ...) are searched
@@ -1310,6 +1442,9 @@ $btnSearch.Add_Click({
             if ($contentUnsupported -gt 0) {
                 $status.Text += " $contentUnsupported files of unsupported types were not opened."
             }
+            if ($cloudSkipped -gt 0) {
+                $status.Text += " $cloudSkipped file(s) not downloaded to this PC were skipped instead of downloading them."
+            }
             if ($truncatedFiles -gt 0) {
                 $status.Text += " Showing the first 20 matches in $truncatedFiles heavily-matching file(s)."
             }
@@ -1332,10 +1467,32 @@ $btnSearch.Add_Click({
         $btnCancel.Enabled = $false
         $form.UseWaitCursor = $false
         $progress.Visible = $false
+        # The window was closed while this search was running (see
+        # Add_FormClosing): the search has now stopped cleanly, so replay the
+        # close. $btnCancel.Enabled is $false at this point, so FormClosing
+        # will let it through instead of deferring again.
+        if ($script:ClosePending) { $form.Close() }
     }
 })
 
+# Save the final UI state and recent terms when the window closes. If a search
+# is still running, defer the close instead: request cancellation the same
+# cooperative way the Cancel button does, and let the search's own `finally`
+# block replay Close() once the loop has actually stopped. Without this, the
+# window would disappear while the search kept running against disposed
+# controls in the background -- which looks like "Close hangs".
 $form.Add_FormClosing({
+    if ($btnCancel.Enabled) {
+        # Still running (also covers a repeat close click while a previous one
+        # is already pending): keep deferring rather than letting this attempt
+        # fall through to a real close, which would strand the search again.
+        $_.Cancel = $true
+        $script:ClosePending = $true
+        $script:CancelRequested = $true
+        $status.Text = "Closing..."
+        return
+    }
+
     $s = $script:Settings
     $s.Folder = $txtFolder.Text
     $s.NameHistory = Add-HistoryEntry -History $txtName.Items -Entry $txtName.Text
@@ -1377,6 +1534,33 @@ if ($script:Settings.ContextLines) {
     $clamped = [Math]::Max($numContext.Minimum, [Math]::Min($numContext.Maximum, [int]$script:Settings.ContextLines))
     $numContext.Value = $clamped
 }
+# Live CPU/RAM readout for this process, refreshed once a second. CPU% is
+# computed the same way Task Manager does: processor time consumed since the
+# last sample, divided by wall-clock time elapsed and by core count.
+$script:UsageProcess = [Diagnostics.Process]::GetCurrentProcess()
+$script:LastCpuSampleTime = Get-Date
+$script:LastCpuTime = $script:UsageProcess.TotalProcessorTime
+$resourceTimer = New-Object System.Windows.Forms.Timer
+$resourceTimer.Interval = 1000
+$resourceTimer.Add_Tick({
+    try {
+        $script:UsageProcess.Refresh()
+        $now = Get-Date
+        $cpuNow = $script:UsageProcess.TotalProcessorTime
+        $elapsedMs = ($now - $script:LastCpuSampleTime).TotalMilliseconds
+        $cpuPercent = 0
+        if ($elapsedMs -gt 0) {
+            $cpuPercent = [Math]::Max(0, [Math]::Round((($cpuNow - $script:LastCpuTime).TotalMilliseconds / $elapsedMs / [Environment]::ProcessorCount) * 100))
+        }
+        $script:LastCpuTime = $cpuNow
+        $script:LastCpuSampleTime = $now
+        $lblResourceUsage.Text = "CPU {0}%  RAM {1}" -f $cpuPercent, (Format-Size $script:UsageProcess.WorkingSet64)
+    } catch { }
+})
+$resourceTimer.Start()
+$form.Add_FormClosed({ $resourceTimer.Stop() })
+
 Set-AdvancedPanelVisible -Show ([bool]$script:Settings.AdvancedVisible)
 
+# Start the modal Windows Forms message loop. Execution ends when the form closes.
 [void]$form.ShowDialog()
